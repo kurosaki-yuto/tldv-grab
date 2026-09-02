@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# tldv-grab — 自分の tl;dv ミーティング録画を mp4 で取得する
+#
+#   tldv-grab list                 直近のミーティング一覧
+#   tldv-grab get <meetingId>      録画を mp4 で保存 (公式API)
+#   tldv-grab hls <playlist.m3u8>  ブラウザで捕まえたプレイリストから結合 (フォールバック)
+#
+# API キー: https://tldv.io/app/settings/personal-settings/api-keys で発行し
+#           export TLDV_API_KEY=... するか ~/.tldv-key に置く
+# 注意: 公式APIは録画のオーナー(主催者)が Pro/Business/Enterprise の場合のみ通る。
+#       Free プランの録画は API Access が無いので 401/403 になる。
+
+set -euo pipefail
+
+API="https://pasta.tldv.io/v1alpha1"
+
+key() {
+  if [[ -n "${TLDV_API_KEY:-}" ]]; then printf '%s' "$TLDV_API_KEY"
+  elif [[ -f "$HOME/.tldv-key" ]]; then tr -d '\n\r ' < "$HOME/.tldv-key"
+  else echo "TLDV_API_KEY が未設定。https://tldv.io/app/settings/personal-settings/api-keys で発行して export するか ~/.tldv-key に保存してください。" >&2; exit 1
+  fi
+}
+
+need() { command -v "$1" >/dev/null || { echo "$1 が要ります (brew install $1)" >&2; exit 1; }; }
+
+cmd_list() {
+  need jq
+  curl -sS -H "x-api-key: $(key)" "$API/meetings?page=1&limit=${1:-25}" \
+    | jq -r '(.results // .data // .)[]? | [.id, (.happenedAt // "")[0:10], (.name // "(no name)")] | @tsv' \
+    | column -t -s $'\t'
+}
+
+cmd_get() {
+  need ffmpeg
+  local id="$1" k out
+  k="$(key)"
+  out="${2:-}"
+  if [[ -z "$out" ]]; then
+    local name
+    name="$(curl -sS -H "x-api-key: $k" "$API/meetings/$id" \
+             | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)"
+    [[ -z "$name" ]] && name="$id"
+    out="$(printf '%s' "$name" | tr '/:' '__' | cut -c1-80).mp4"
+  fi
+
+  echo "==> 署名付きダウンロードURLを取得: $id"
+  local code signed
+  signed="$(curl -sS -o /dev/null -D - -H "x-api-key: $k" "$API/meetings/$id/download" \
+            | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | tail -1)"
+  if [[ -z "$signed" ]]; then
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -H "x-api-key: $k" "$API/meetings/$id/download")"
+    echo "署名付きURLが取れませんでした (HTTP $code)。" >&2
+    echo "  401/403 → APIキーが無効、または録画オーナーが Free プラン (API Access 無し)。" >&2
+    echo "  その場合は 'tldv-grab hls' のフォールバックを使ってください。" >&2
+    exit 1
+  fi
+
+  echo "==> ダウンロード -> $out"
+  case "$signed" in
+    *.m3u8*) ffmpeg -hide_banner -loglevel warning -stats -i "$signed" -c copy -bsf:a aac_adtstoasc "$out" ;;
+    *)       curl -fL --progress-bar "$signed" -o "$out" ;;
+  esac
+  echo "完了: $out"
+}
+
+cmd_hls() {
+  need ffmpeg
+  local pl="$1" out="${2:-tldv-recording.mp4}"
+  [[ -f "$pl" ]] || { echo "プレイリストが見つかりません: $pl" >&2; exit 1; }
+  echo "==> プレイリストから結合 -> $out"
+  echo "    (セグメントの署名は発行から約48時間で切れます)"
+  ffmpeg -hide_banner -loglevel warning -stats \
+         -protocol_whitelist file,http,https,tcp,tls,crypto \
+         -i "$pl" -c copy -bsf:a aac_adtstoasc "$out"
+  echo "完了: $out"
+}
+
+
+cmd_decode() {
+  local inf="$1" out="${2:-decoded.m3u8}"
+  [[ -f "$inf" ]] || { echo "ファイルが無い: $inf" >&2; exit 1; }
+  node -e '
+    const fs=require("fs");
+    const raw=fs.readFileSync(process.argv[1],"utf8");
+    const rot=(s,k)=>{let o="";for(let i=0;i<s.length;i++){const c=s.charCodeAt(i);
+      if(c>=65&&c<=90)o+=String.fromCharCode(((c-65+k)%26+26)%26+65);
+      else if(c>=97&&c<=122)o+=String.fromCharCode(((c-97+k)%26+26)%26+97);
+      else o+=s[i];}return o;};
+    const lines=raw.split("\n");
+    let pl;
+    if(lines.length>=2&&lines[1].startsWith("#TLDVCONF:")){
+      const p=lines[1].slice(10).split(",");
+      const shift=Number(p[1]), prefix=p.slice(2).join(",");
+      if(!(shift>=0&&shift<=25)){console.error("shift 範囲外:",shift);process.exit(1);}
+      const out=[lines[0]];
+      for(const l of lines.slice(2)) out.push(l&&!l.startsWith("#")?prefix+rot(l,shift):l);
+      pl=out.join("\n");
+      console.error("復号: shift="+shift);
+    } else { pl=raw; console.error("#TLDVCONF なし。素のm3u8として扱う"); }
+    const segs=pl.split("\n").filter(l=>l.trim()&&!l.startsWith("#"));
+    const ext=[...pl.matchAll(/#EXTINF:([\d.]+)/g)].map(m=>parseFloat(m[1]));
+    const sum=ext.reduce((a,b)=>a+b,0);
+    console.error("segments="+segs.length+" seconds="+sum.toFixed(1)
+      +" signed="+/X-Amz-Signature=/.test(pl)
+      +" endlist="+pl.includes("#EXT-X-ENDLIST")
+      +" master="+pl.includes("#EXT-X-STREAM-INF"));
+    fs.writeFileSync(process.argv[2],pl);
+  ' "$inf" "$out"
+  echo "出力: $out"
+}
+
+cmd_dl() {
+  need ffmpeg
+  local pl="$1" out="${2:-tldv.mp4}"
+  [[ -f "$pl" ]] || { echo "プレイリストが無い: $pl" >&2; exit 1; }
+  grep -q '#EXT-X-ENDLIST' "$pl" || { echo "警告: #EXT-X-ENDLIST が無い。不完全なプレイリストの可能性" >&2; }
+  local want
+  want=$(grep -o '#EXTINF:[0-9.]*' "$pl" | cut -d: -f2 | awk '{s+=$1} END{printf "%.1f", s}')
+  echo "==> プレイリスト尺: ${want}s / セグメント $(grep -vc '^#' "$pl")本"
+  if command -v yt-dlp >/dev/null; then
+    # --abort-on-unavailable-fragment 必須。無いと1本欠けても無言で切り詰めて exit 0 する
+    yt-dlp --enable-file-urls --hls-prefer-native --force-overwrites \
+           --abort-on-unavailable-fragment --retries 10 --fragment-retries 20 \
+           -N 16 -o "$out" "file://$(cd "$(dirname "$pl")" && pwd)/$(basename "$pl")"
+  else
+    ffmpeg -hide_banner -loglevel warning -stats \
+           -protocol_whitelist file,http,https,tcp,tls,crypto -allowed_extensions ALL \
+           -i "$pl" -c copy -bsf:a aac_adtstoasc "$out"
+  fi
+  local got
+  got=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" | awk '{printf "%.1f", $1}')
+  echo "==> 検証: プレイリスト ${want}s / 出力 ${got}s"
+  awk -v a="$want" -v b="$got" 'BEGIN{d=a-b; if(d<0)d=-d; if(d>2){print "NG: 尺が合わない。欠落の疑い"; exit 1} else print "OK: 尺一致"}'
+}
+
+case "${1:-}" in
+  list) shift; cmd_list "$@" ;;
+  get)  shift; [[ $# -ge 1 ]] || { echo "usage: tldv-grab get <meetingId> [out.mp4]" >&2; exit 1; }; cmd_get "$@" ;;
+  decode) shift; [[ $# -ge 1 ]] || { echo "usage: tldv-grab decode <raw.m3u8> [out.m3u8]" >&2; exit 1; }; cmd_decode "$@" ;;
+  dl)     shift; [[ $# -ge 1 ]] || { echo "usage: tldv-grab dl <decoded.m3u8> [out.mp4]" >&2; exit 1; }; cmd_dl "$@" ;;
+  hls)  shift; [[ $# -ge 1 ]] || { echo "usage: tldv-grab hls <playlist.m3u8> [out.mp4]" >&2; exit 1; }; cmd_hls "$@" ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac
